@@ -2,6 +2,8 @@ const express=require('express');
 const cors=require('cors');
 const crypto=require('crypto');
 const https=require('https');
+let Pool=null;try{Pool=require('pg').Pool;}catch(e){}
+const dbPool=(Pool&&process.env.DATABASE_URL)?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='false'?false:{rejectUnauthorized:false}}):null;
 const app=express();
 const appVersions={
   customer:{app:'customer',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
@@ -72,6 +74,26 @@ const restaurant={id:'GRR01',name:'Gajab Rasoda',status:'ONLINE',activationDate:
 const customers={}, riders={'GRD01':{id:'GRD01',name:'Delivery Partner 01',mobile:'',status:'ACTIVE',online:false,createdAt:now()}};
 const orders=[], onboarding=[], grievances=[], partnerPayouts=[], riderPayouts=[];
 const locations={}, riderAccounts={}, partnerAccounts={'GRR01':{restaurantId:'GRR01',payoutMethod:'',upiId:'',bankLast4:'',payoutEnabled:false}};
+
+function snapshotState(){return {seq,menu,restaurantMeta:{status:restaurant.status,activationDate:restaurant.activationDate},customers,riders,orders,onboarding,grievances,partnerPayouts,riderPayouts,locations,riderAccounts,partnerAccounts,appVersions};}
+async function initPersistentState(){
+  if(!dbPool){console.log('DATABASE_URL not set: running memory-only');return;}
+  await dbPool.query('CREATE TABLE IF NOT EXISTS gajab_state (id INTEGER PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
+  const r=await dbPool.query('SELECT data FROM gajab_state WHERE id=1');
+  if(!r.rows.length)return;
+  const d=r.rows[0].data||{};
+  if(d.seq)seq=Object.assign(seq,d.seq);
+  if(Array.isArray(d.menu)){menu.splice(0,menu.length,...d.menu);restaurant.menu=menu;}
+  if(d.restaurantMeta){restaurant.status=d.restaurantMeta.status||restaurant.status;restaurant.activationDate=d.restaurantMeta.activationDate||restaurant.activationDate;}
+  if(d.customers)Object.assign(customers,d.customers);if(d.riders)Object.assign(riders,d.riders);
+  if(Array.isArray(d.orders))orders.splice(0,orders.length,...d.orders);if(Array.isArray(d.onboarding))onboarding.splice(0,onboarding.length,...d.onboarding);if(Array.isArray(d.grievances))grievances.splice(0,grievances.length,...d.grievances);
+  if(Array.isArray(d.partnerPayouts))partnerPayouts.splice(0,partnerPayouts.length,...d.partnerPayouts);if(Array.isArray(d.riderPayouts))riderPayouts.splice(0,riderPayouts.length,...d.riderPayouts);
+  if(d.locations)Object.assign(locations,d.locations);if(d.riderAccounts)Object.assign(riderAccounts,d.riderAccounts);if(d.partnerAccounts)Object.assign(partnerAccounts,d.partnerAccounts);if(d.appVersions)Object.assign(appVersions,d.appVersions);
+  console.log('Persistent state loaded from PostgreSQL');
+}
+let persistBusy=false;async function persistState(){if(!dbPool||persistBusy)return;persistBusy=true;try{await dbPool.query('INSERT INTO gajab_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated_at=NOW()',[JSON.stringify(snapshotState())]);}catch(e){console.error('persist failed',e.message);}finally{persistBusy=false;}}
+setInterval(()=>persistState(),2000);
+
 
 function nextId(k,p){seq[k]++;return id2(p,seq[k]);}
 function nextWorkingDay(){
@@ -216,6 +238,7 @@ app.post('/admin/orders/:id/approve-payment',(req,res)=>{
   o.paymentId=String(req.body.paymentId||req.body.reference||'MANUAL');
   o.status='PLACED';
   o.updatedAt=now();
+  persistState();
   res.json({ok:true,order:o});
 });
   res.json({orderId:o.id,paymentStatus:o.paymentStatus,status:o.status,expectedAmount:o.total,paymentId:o.paymentId||'',paymentLinkId:o.razorpayPaymentLinkId||''});
@@ -263,8 +286,8 @@ app.get('/onboarding/rider',(req,res)=>res.type('html').send('<html><body><h2>GA
 
 app.get('/delivery/profile',(req,res)=>{const id=String(req.query.deliveryPartnerId||'GRD01');res.json({...riders[id],...(riderAccounts[id]||{deliveryPartnerId:id,payoutMethod:'',upiId:'',bankLast4:'',payoutEnabled:false})});});
 app.post('/delivery/profile',(req,res)=>{const id=String(req.body.deliveryPartnerId||'GRD01');if(!riders[id])riders[id]={id,name:'',mobile:'',status:'ACTIVE',online:false,createdAt:now()};const a=riderAccounts[id]||{deliveryPartnerId:id};a.upiId=String(req.body.upiId||a.upiId||'');a.bankLast4=String(req.body.bankLast4||a.bankLast4||'');a.payoutMethod=String(req.body.payoutMethod||a.payoutMethod||'');a.payoutEnabled=!!(a.upiId||a.bankLast4);a.updatedAt=now();riderAccounts[id]=a;res.json(a);});
-app.get('/delivery/orders',(req,res)=>{const id=String(req.query.deliveryPartnerId||'GRD01');res.json({orders:orders.filter(o=>['READY','OUT_FOR_DELIVERY'].includes(o.status)).filter(o=>!o.deliveryPartnerId||o.deliveryPartnerId===id).map(o=>({...o,riderEarning:riderEarning(o.deliveryDistanceKm),orderValueHidden:true})),serverTime:Date.now()});});
-app.patch('/delivery/orders/:id/accept',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(o.status!=='READY')return res.status(409).json({error:'order_not_ready'});const id=String(req.body.deliveryPartnerId||'GRD01');if(o.deliveryPartnerId&&o.deliveryPartnerId!==id)return res.status(409).json({error:'already_assigned'});o.deliveryPartnerId=id;o.updatedAt=now();res.json({...o,riderEarning:riderEarning(o.deliveryDistanceKm)});});
+app.get('/delivery/orders',(req,res)=>{const id=String(req.query.deliveryPartnerId||'GRD01');res.json({orders:orders.filter(o=>['READY','OUT_FOR_DELIVERY'].includes(o.status)).filter(o=>!(o.rejectedBy||[]).includes(id)).filter(o=>!o.deliveryPartnerId||o.deliveryPartnerId===id).map(o=>({...o,riderEarning:riderEarning(o.deliveryDistanceKm),orderValueHidden:true})),serverTime:Date.now()});});
+app.patch('/delivery/orders/:id/accept',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(o.status!=='READY')return res.status(409).json({error:'order_not_ready'});const id=String(req.body.deliveryPartnerId||'GRD01');if(o.deliveryPartnerId&&o.deliveryPartnerId!==id)return res.status(409).json({error:'already_assigned'});o.deliveryPartnerId=id;o.deliveryAccepted=true;o.updatedAt=now();persistState();res.json({...o,riderEarning:riderEarning(o.deliveryDistanceKm)});});
 app.patch('/delivery/orders/:id/reject',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});o.rejectedBy=o.rejectedBy||[];const id=String(req.body.deliveryPartnerId||'GRD01');if(!o.rejectedBy.includes(id))o.rejectedBy.push(id);res.json({ok:true});});
 app.post('/delivery/orders/:id/picked-up',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(o.deliveryPartnerId!==req.body.deliveryPartnerId)return res.status(403).json({error:'not_assigned'});o.status='OUT_FOR_DELIVERY';o.updatedAt=now();res.json(o);});
 app.post('/delivery/orders/:id/verify-pin',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(String(req.body.pin||'')!==String(o.deliveryPin))return res.status(400).json({error:'invalid_pin'});if(o.deliveryPartnerId&&req.body.deliveryPartnerId&&o.deliveryPartnerId!==req.body.deliveryPartnerId)return res.status(403).json({error:'wrong_rider'});o.status='DELIVERED';o.proof=String(req.body.proof||'');o.deliveredAt=now();o.updatedAt=now();ensurePayoutLedgers(o);res.json({ok:true,order:o,riderEarning:riderEarning(o.deliveryDistanceKm)});});
@@ -307,4 +330,4 @@ app.get('/admin/grievances',(req,res)=>res.json({grievances}));
 app.get('/admin/payouts',(req,res)=>res.json({partnerPayouts,riderPayouts}));
 app.patch('/admin/payouts/:type/:id',(req,res)=>{const list=req.params.type==='partner'?partnerPayouts:riderPayouts;const p=list.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({error:'not_found'});p.status=String(req.body.status||p.status);p.reference=String(req.body.reference||p.reference||'');p.updatedAt=now();res.json(p);});
 
-app.listen(PORT,()=>console.log('Gajab Rasoda backend v4 running on :'+PORT));
+initPersistentState().then(()=>app.listen(PORT,()=>console.log('Gajab Rasoda backend persistent v1.1 running on :'+PORT))).catch(e=>{console.error('DB init failed',e);process.exit(1);});
