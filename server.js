@@ -1,7 +1,34 @@
 const express=require('express');
 const cors=require('cors');
+const crypto=require('crypto');
+const https=require('https');
 const app=express();
+const appVersions={
+  customer:{app:'customer',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
+  partner:{app:'partner',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
+  delivery:{app:'delivery',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
+  company:{app:'company',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
+};
+
 app.use(cors());
+app.post('/webhooks/razorpay',express.raw({type:'application/json'}),(req,res)=>{
+  try{
+    const secret=process.env.RAZORPAY_WEBHOOK_SECRET||'';
+    if(!secret)return res.status(503).send('webhook_not_configured');
+    const sig=String(req.headers['x-razorpay-signature']||'');
+    const expected=crypto.createHmac('sha256',secret).update(req.body).digest('hex');
+    if(!sig || !crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(sig)))return res.status(401).send('invalid_signature');
+    const event=JSON.parse(req.body.toString('utf8'));
+    if(event.event==='payment.captured'){
+      const ent=event.payload&&event.payload.payment&&event.payload.payment.entity;
+      if(ent){
+        const o=orders.find(x=>x.razorpayOrderId===ent.order_id);
+        if(o){o.paymentStatus='PAID';o.paymentId=ent.id;o.status='PLACED';o.updatedAt=now();}
+      }
+    }
+    res.send('ok');
+  }catch(e){res.status(400).send('bad_webhook');}
+});
 app.use(express.json({limit:'4mb'}));
 app.use(express.urlencoded({extended:true}));
 const PORT=process.env.PORT||3000;
@@ -27,26 +54,50 @@ const orders=[], onboarding=[], grievances=[], partnerPayouts=[], riderPayouts=[
 const locations={}, riderAccounts={}, partnerAccounts={'GRR01':{restaurantId:'GRR01',payoutMethod:'',upiId:'',bankLast4:'',payoutEnabled:false}};
 
 function nextId(k,p){seq[k]++;return id2(p,seq[k]);}
-function tomorrow(){const d=new Date();d.setDate(d.getDate()+1);return d.toISOString().slice(0,10);}
+function nextWorkingDay(){
+  const d=new Date();d.setDate(d.getDate()+1);
+  while(d.getDay()===0||d.getDay()===6)d.setDate(d.getDate()+1);
+  return d.toISOString().slice(0,10);
+}
 function riderEarning(km){km=Math.max(0,Number(km||0));return Math.round((30+Math.max(0,km-3)*8)*100)/100;}
 function partnerSettlement(order){
   const gross=Number(order.total||0);
-  const commission=Math.round(gross*0.10*100)/100;
-  const processing=Math.round(gross*0.0184*100)/100;
-  const net=Math.round((gross-commission-processing)*100)/100;
-  return {gross,commission,processing,net};
+  const activated=new Date(restaurant.activationDate).getTime();
+  const ageDays=Math.floor((Date.now()-activated)/(24*60*60*1000));
+  const commissionRate=ageDays<15?0:0.10;
+  const commission=Math.round(gross*commissionRate*100)/100;
+  const processingRate=0.0184;
+  const processing=Math.round(gross*processingRate*100)/100;
+  const deliveryCharge=riderEarning(order.deliveryDistanceKm);
+  const net=Math.round((gross-commission-processing-deliveryCharge)*100)/100;
+  return {gross,commissionRate,commission,processingRate,processing,deliveryCharge,net,freeCommissionDaysRemaining:Math.max(0,15-ageDays)};
 }
 function ensurePayoutLedgers(order){
   if(!riderPayouts.some(x=>x.orderId===order.id) && order.deliveryPartnerId){
-    riderPayouts.unshift({id:'GRDP'+String(++seq.riderPayout).padStart(4,'0'),orderId:order.id,deliveryPartnerId:order.deliveryPartnerId,amount:riderEarning(order.deliveryDistanceKm),status:'SCHEDULED_T_PLUS_1',dueDate:tomorrow(),createdAt:now()});
+    riderPayouts.unshift({id:'GRDP'+String(++seq.riderPayout).padStart(4,'0'),orderId:order.id,deliveryPartnerId:order.deliveryPartnerId,amount:riderEarning(order.deliveryDistanceKm),status:'SCHEDULED_T_PLUS_1',dueDate:nextWorkingDay(),createdAt:now()});
   }
   if(!partnerPayouts.some(x=>x.orderId===order.id)){
     const x=partnerSettlement(order);
-    partnerPayouts.unshift({id:'GRPP'+String(++seq.partnerPayout).padStart(4,'0'),orderId:order.id,restaurantId:order.restaurantId, ...x,status:'SCHEDULED_T_PLUS_1',dueDate:tomorrow(),createdAt:now()});
+    partnerPayouts.unshift({id:'GRPP'+String(++seq.partnerPayout).padStart(4,'0'),orderId:order.id,restaurantId:order.restaurantId, ...x,status:'SCHEDULED_T_PLUS_1',dueDate:nextWorkingDay(),createdAt:now()});
   }
 }
 
-app.get('/health',(req,res)=>res.json({ok:true,service:'Gajab Rasoda Backend',version:'consolidated-v4'}));
+app.get('/health',(req,res)=>res.json({ok:true,service:'Gajab Rasoda Backend',version:'1.0'}));
+
+app.get('/app-config/:app',(req,res)=>{
+  const x=appVersions[String(req.params.app||'').toLowerCase()];
+  if(!x)return res.status(404).json({error:'unknown_app'});
+  res.json(x);
+});
+app.get('/admin/app-versions',(req,res)=>res.json({apps:Object.values(appVersions)}));
+app.patch('/admin/app-versions/:app',(req,res)=>{
+  const key=String(req.params.app||'').toLowerCase(),x=appVersions[key];
+  if(!x)return res.status(404).json({error:'unknown_app'});
+  ['latestVersionCode','minSupportedVersionCode','latestVersionName','forceUpdate','updateUrl','releaseNotes'].forEach(k=>{
+    if(req.body&&req.body[k]!==undefined)x[k]=req.body[k];
+  });
+  res.json(x);
+});
 
 app.get('/customer/restaurant',(req,res)=>res.json(restaurant));
 app.get('/customer/menu',(req,res)=>res.json({restaurantId:restaurant.id,status:restaurant.status,menu:restaurant.menu}));
@@ -66,24 +117,88 @@ app.post('/customer/orders',(req,res)=>{
   const items=req.body.items;if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'items_required'});
   let total=0;const normalized=[];
   for(const raw of items){const m=menu.find(x=>x.id===raw.id)||menu.find(x=>x.name===raw.name);if(!m)return res.status(400).json({error:'unknown_item'});if(!m.available)return res.status(409).json({error:'item_unavailable',item:m.id});const q=Math.max(1,Number(raw.qty||1));normalized.push({id:m.id,name:m.name,qty:q,price:m.price,category:m.category,image:m.image||''});total+=m.price*q;}
-  const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PLACED',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),createdAt:now(),updatedAt:now()};
-  orders.unshift(o);res.status(201).json(o);
+  const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),createdAt:now(),updatedAt:now()};
+  orders.unshift(o);
+  o.paymentUrl=req.protocol+'://'+req.get('host')+'/payments/start/'+encodeURIComponent(o.id);
+  res.status(201).json(o);
 });
 app.get('/customer/orders',(req,res)=>{const cid=String(req.query.customerId||''),p=String(req.query.phone||'');res.json({orders:orders.filter(o=>(cid&&o.customerId===cid)||(p&&o.customerPhone===p))});});
 app.get('/customer/orders/:id',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});res.json({...o,tracking:locations[o.id]||null,restaurantStatus:restaurant.status});});
+
+
+function createRazorpayOrder(appOrder){
+  return new Promise((resolve,reject)=>{
+    const keyId=process.env.RAZORPAY_KEY_ID||'',secret=process.env.RAZORPAY_KEY_SECRET||'';
+    if(!keyId||!secret)return reject(new Error('payment_not_configured'));
+    const payload=JSON.stringify({amount:Math.round(appOrder.total*100),currency:'INR',receipt:appOrder.id,notes:{app_order_id:appOrder.id},capture:'automatic'});
+    const auth=Buffer.from(keyId+':'+secret).toString('base64');
+    const q=https.request({hostname:'api.razorpay.com',path:'/v1/orders',method:'POST',headers:{'Authorization':'Basic '+auth,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}},r=>{
+      let body='';r.on('data',d=>body+=d);r.on('end',()=>{try{const j=JSON.parse(body);if(r.statusCode>=200&&r.statusCode<300)return resolve(j);reject(new Error(j&&j.error&&j.error.description||'razorpay_order_failed'));}catch(e){reject(e);}});
+    });
+    q.on('error',reject);q.write(payload);q.end();
+  });
+}
+app.get('/payments/start/:id',async(req,res)=>{
+  const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).send('Order not found');
+  const keyId=process.env.RAZORPAY_KEY_ID||'';
+  if(!keyId||!process.env.RAZORPAY_KEY_SECRET)return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Online payment setup pending</h2><p>Razorpay Orders API keys are not configured on the backend yet.</p><p>Order '+o.id+' remains unpaid and will not be sent to the restaurant.</p></body></html>');
+  try{
+    if(!o.razorpayOrderId){const rz=await createRazorpayOrder(o);o.razorpayOrderId=rz.id;o.updatedAt=now();}
+    const html=`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://checkout.razorpay.com/v1/checkout.js"></script></head><body style="font-family:Arial;background:#111;color:#fff;padding:24px"><h2 style="color:#e8ab2e">GAJAB RASODA</h2><p>Order ${o.id}</p><h3>Pay ₹${o.total}</h3><button id="pay" style="padding:14px 22px;border:0;border-radius:12px;background:#e51e24;color:white;font-weight:bold">Pay Online</button><div id="msg"></div><script>
+      const options={key:${JSON.stringify(keyId)},amount:${Math.round(o.total*100)},currency:"INR",name:"GAJAB RASODA",description:"Order ${o.id}",order_id:${JSON.stringify(o.razorpayOrderId)},handler:async function(r){
+        document.getElementById('msg').innerText='Verifying payment...';
+        const x=await fetch('/payments/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({appOrderId:${JSON.stringify(o.id)},razorpay_payment_id:r.razorpay_payment_id,razorpay_order_id:r.razorpay_order_id,razorpay_signature:r.razorpay_signature})});
+        const j=await x.json();document.getElementById('msg').innerText=j.ok?'Payment successful. Order sent to restaurant.':'Payment verification failed.';
+      },theme:{color:"#e51e24"}};
+      document.getElementById('pay').onclick=()=>new Razorpay(options).open();
+    </script></body></html>`;
+    res.type('html').send(html);
+  }catch(e){res.status(502).type('html').send('<html><body><h3>Payment could not start</h3><p>'+String(e.message||'')+'</p></body></html>');}
+});
+app.post('/payments/verify',(req,res)=>{
+  try{
+    const o=orders.find(x=>x.id===req.body.appOrderId);if(!o)return res.status(404).json({error:'order_not_found'});
+    if(!o.razorpayOrderId||o.razorpayOrderId!==req.body.razorpay_order_id)return res.status(400).json({error:'order_mismatch'});
+    const secret=process.env.RAZORPAY_KEY_SECRET||'';if(!secret)return res.status(503).json({error:'payment_not_configured'});
+    const expected=crypto.createHmac('sha256',secret).update(o.razorpayOrderId+'|'+String(req.body.razorpay_payment_id||'')).digest('hex');
+    const got=String(req.body.razorpay_signature||'');
+    if(expected.length!==got.length||!crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(got)))return res.status(400).json({error:'invalid_signature'});
+    o.paymentStatus='PAID';o.paymentId=String(req.body.razorpay_payment_id);o.status='PLACED';o.updatedAt=now();
+    res.json({ok:true,orderId:o.id,status:o.status,paymentStatus:o.paymentStatus});
+  }catch(e){res.status(400).json({error:'verification_failed'});}
+});
 
 app.get('/partner/restaurant',(req,res)=>res.json(restaurant));
 app.patch('/partner/restaurant/status',(req,res)=>{const s=String(req.body.status||'').toUpperCase();if(!['ONLINE','OFFLINE'].includes(s))return res.status(400).json({error:'invalid_status'});restaurant.status=s;res.json(restaurant);});
 app.patch('/partner/menu/:id/availability',(req,res)=>{const m=menu.find(x=>x.id===req.params.id);if(!m)return res.status(404).json({error:'item_not_found'});m.available=!!req.body.available;res.json(m);});
 app.post('/partner/menu',(req,res)=>{const name=String(req.body.name||'').trim(),price=Number(req.body.price||0);if(!name||price<=0)return res.status(400).json({error:'name_and_price_required'});const m={id:'dish_'+Date.now(),name,price,available:req.body.available!==false,category:String(req.body.category||'VEG'),image:String(req.body.image||'')};menu.push(m);res.status(201).json(m);});
 app.patch('/partner/menu/:id',(req,res)=>{const m=menu.find(x=>x.id===req.params.id);if(!m)return res.status(404).json({error:'item_not_found'});['name','category','image'].forEach(k=>{if(req.body[k]!==undefined)m[k]=String(req.body[k]);});if(req.body.price!==undefined)m.price=Number(req.body.price);if(req.body.available!==undefined)m.available=!!req.body.available;res.json(m);});
-app.get('/partner/orders',(req,res)=>res.json({orders:[...orders].sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)),serverTime:Date.now()}));
+app.get('/partner/orders',(req,res)=>res.json({orders:orders.filter(o=>o.paymentStatus==='PAID').sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)),serverTime:Date.now()}));
 app.patch('/partner/orders/:id/status',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});const s=String(req.body.status||'');if(!['ACCEPTED','REJECTED','PREPARING','READY','OUT_FOR_DELIVERY','DELIVERED'].includes(s))return res.status(400).json({error:'invalid_status'});o.status=s;o.updatedAt=now();if(s==='DELIVERED')ensurePayoutLedgers(o);res.json(o);});
 app.get('/partner/finance',(req,res)=>{
-  const delivered=orders.filter(o=>o.restaurantId===restaurant.id&&o.status==='DELIVERED');
-  const gross=delivered.reduce((s,o)=>s+o.total,0),commission=Math.round(gross*.10*100)/100,processing=Math.round(gross*.0184*100)/100,net=Math.round((gross-commission-processing)*100)/100;
-  const pending=partnerPayouts.filter(p=>p.status!=='PAID').reduce((s,p)=>s+p.net,0);
-  res.json({restaurantId:restaurant.id,todaySales:gross,completedOrders:delivered.length,grossSales:gross,commission,processingFee:processing,netEarning:net,pendingSettlement:Math.round(pending*100)/100,payouts:partnerPayouts});
+  const delivered=orders.filter(o=>o.restaurantId===restaurant.id&&o.status==='DELIVERED'&&o.paymentStatus==='PAID');
+  let gross=0,commission=0,processing=0,deliveryCharges=0,net=0;
+  delivered.forEach(o=>{const x=partnerSettlement(o);gross+=x.gross;commission+=x.commission;processing+=x.processing;deliveryCharges+=x.deliveryCharge;net+=x.net;});
+  const ageDays=Math.floor((Date.now()-new Date(restaurant.activationDate).getTime())/(24*60*60*1000));
+  const commissionRate=ageDays<15?0:0.10;
+  const pending=partnerPayouts.filter(p=>p.status!=='PAID').reduce((sum,p)=>sum+p.net,0);
+  res.json({
+    restaurantId:restaurant.id,
+    todaySales:Math.round(gross*100)/100,
+    completedOrders:delivered.length,
+    grossSales:Math.round(gross*100)/100,
+    commissionRate,
+    commission:Math.round(commission*100)/100,
+    processingRate:0.0184,
+    processingFee:Math.round(processing*100)/100,
+    deliveryCharges:Math.round(deliveryCharges*100)/100,
+    netEarning:Math.round(net*100)/100,
+    pendingSettlement:Math.round(pending*100)/100,
+    freeCommissionDaysRemaining:Math.max(0,15-ageDays),
+    settlementCycle:'T+1 NEXT WORKING DAY',
+    payoutTerms:'0% commission first 15 calendar days after activation, then 10%; 1.84% processing/transfer fee; delivery charges borne by restaurant.',
+    payouts:partnerPayouts
+  });
 });
 app.post('/partner/payout-account',(req,res)=>{const a=partnerAccounts[restaurant.id];a.upiId=String(req.body.upiId||'');a.bankLast4=String(req.body.bankLast4||'');a.payoutMethod=String(req.body.payoutMethod||'');a.payoutEnabled=!!(a.upiId||a.bankLast4);a.updatedAt=now();res.json(a);});
 app.get('/partner/payout-account',(req,res)=>res.json(partnerAccounts[restaurant.id]));
@@ -115,7 +230,20 @@ app.patch('/admin/delivery/appeals/:id',(req,res)=>{const g=grievances.find(x=>x
 
 app.get('/admin/dashboard',(req,res)=>{
   const delivered=orders.filter(o=>o.status==='DELIVERED'),gross=delivered.reduce((s,o)=>s+o.total,0);
-  res.json({customers:Object.keys(customers).length,riders:Object.keys(riders).length,restaurants:1,totalOrders:orders.length,openOrders:orders.filter(o=>o.status!=='DELIVERED'&&o.status!=='REJECTED').length,completedOrders:delivered.length,grossSales:gross,newOnboarding:onboarding.filter(x=>x.status==='SUBMITTED').length,openGrievances:grievances.filter(g=>g.status!=='RESOLVED').length,pendingPartnerPayouts:partnerPayouts.filter(p=>p.status!=='PAID').length,pendingRiderPayouts:riderPayouts.filter(p=>p.status!=='PAID').length});
+  res.json({
+    customers:Object.keys(customers).length,riders:Object.keys(riders).length,restaurants:1,totalOrders:orders.length,
+    openOrders:orders.filter(o=>!['DELIVERED','REJECTED'].includes(o.status)).length,completedOrders:delivered.length,grossSales:gross,
+    newOnboarding:onboarding.filter(x=>x.status==='SUBMITTED').length,openGrievances:grievances.filter(g=>g.status!=='RESOLVED').length,
+    pendingPartnerPayouts:partnerPayouts.filter(p=>p.status!=='PAID').length,pendingRiderPayouts:riderPayouts.filter(p=>p.status!=='PAID').length,
+    orderStatus:{
+      paymentPending:orders.filter(o=>o.status==='PAYMENT_PENDING').length,
+      placed:orders.filter(o=>o.status==='PLACED').length,
+      preparing:orders.filter(o=>['ACCEPTED','PREPARING'].includes(o.status)).length,
+      ready:orders.filter(o=>o.status==='READY').length,
+      outForDelivery:orders.filter(o=>o.status==='OUT_FOR_DELIVERY').length,
+      completed:orders.filter(o=>o.status==='DELIVERED').length
+    }
+  });
 });
 app.get('/admin/customers',(req,res)=>res.json({customers:Object.values(customers)}));
 app.get('/admin/riders',(req,res)=>res.json({riders:Object.values(riders).map(r=>({...r,payout:riderAccounts[r.id]||{}}))}));
