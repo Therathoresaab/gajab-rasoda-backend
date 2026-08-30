@@ -17,13 +17,33 @@ app.post('/webhooks/razorpay',express.raw({type:'application/json'}),(req,res)=>
     if(!secret)return res.status(503).send('webhook_not_configured');
     const sig=String(req.headers['x-razorpay-signature']||'');
     const expected=crypto.createHmac('sha256',secret).update(req.body).digest('hex');
-    if(!sig || !crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(sig)))return res.status(401).send('invalid_signature');
+    if(!sig||expected.length!==sig.length||!crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(sig)))return res.status(401).send('invalid_signature');
     const event=JSON.parse(req.body.toString('utf8'));
-    if(event.event==='payment.captured'){
+
+    if(event.event==='payment_link.paid'){
+      const pl=event.payload&&event.payload.payment_link&&event.payload.payment_link.entity;
+      const pay=event.payload&&event.payload.payment&&event.payload.payment.entity;
+      if(pl){
+        const ref=String(pl.reference_id||'');
+        const o=orders.find(x=>x.id===ref || x.razorpayPaymentLinkId===pl.id);
+        if(o){
+          const expectedPaise=Math.round(o.total*100);
+          const paidPaise=Number(pl.amount_paid||0);
+          const linkAmount=Number(pl.amount||0);
+          if(pl.status==='paid' && paidPaise===expectedPaise && linkAmount===expectedPaise){
+            o.paymentStatus='PAID';o.paymentId=pay&&pay.id||'';o.paymentReference=ref;o.status='PLACED';o.updatedAt=now();
+          }else{
+            o.paymentStatus='PAYMENT_REVIEW';o.paymentReviewReason='amount_or_status_mismatch';o.updatedAt=now();
+          }
+        }
+      }
+    }else if(event.event==='payment.captured'){
       const ent=event.payload&&event.payload.payment&&event.payload.payment.entity;
       if(ent){
         const o=orders.find(x=>x.razorpayOrderId===ent.order_id);
-        if(o){o.paymentStatus='PAID';o.paymentId=ent.id;o.status='PLACED';o.updatedAt=now();}
+        if(o && Number(ent.amount||0)===Math.round(o.total*100)){
+          o.paymentStatus='PAID';o.paymentId=ent.id;o.status='PLACED';o.updatedAt=now();
+        }
       }
     }
     res.send('ok');
@@ -114,10 +134,18 @@ app.post('/customer/profile/:phone/addresses',(req,res)=>{
 });
 app.post('/customer/orders',(req,res)=>{
   if(restaurant.status!=='ONLINE')return res.status(409).json({error:'restaurant_offline'});
+  const attempt=String(req.body.checkoutAttemptId||'').trim();
+  if(attempt){
+    const existing=orders.find(x=>x.checkoutAttemptId===attempt && x.customerPhone===String(req.body.customerPhone||''));
+    if(existing){
+      existing.paymentUrl=req.protocol+'://'+req.get('host')+'/payments/start/'+encodeURIComponent(existing.id);
+      return res.json(existing);
+    }
+  }
   const items=req.body.items;if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'items_required'});
   let total=0;const normalized=[];
   for(const raw of items){const m=menu.find(x=>x.id===raw.id)||menu.find(x=>x.name===raw.name);if(!m)return res.status(400).json({error:'unknown_item'});if(!m.available)return res.status(409).json({error:'item_unavailable',item:m.id});const q=Math.max(1,Number(raw.qty||1));normalized.push({id:m.id,name:m.name,qty:q,price:m.price,category:m.category,image:m.image||''});total+=m.price*q;}
-  const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),createdAt:now(),updatedAt:now()};
+  const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),checkoutAttemptId:attempt,createdAt:now(),updatedAt:now()};
   orders.unshift(o);
   o.paymentUrl=req.protocol+'://'+req.get('host')+'/payments/start/'+encodeURIComponent(o.id);
   res.status(201).json(o);
@@ -126,46 +154,59 @@ app.get('/customer/orders',(req,res)=>{const cid=String(req.query.customerId||''
 app.get('/customer/orders/:id',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});res.json({...o,tracking:locations[o.id]||null,restaurantStatus:restaurant.status});});
 
 
-function createRazorpayOrder(appOrder){
+function createRazorpayPaymentLink(appOrder){
   return new Promise((resolve,reject)=>{
     const keyId=process.env.RAZORPAY_KEY_ID||'',secret=process.env.RAZORPAY_KEY_SECRET||'';
     if(!keyId||!secret)return reject(new Error('payment_not_configured'));
-    const payload=JSON.stringify({amount:Math.round(appOrder.total*100),currency:'INR',receipt:appOrder.id,notes:{app_order_id:appOrder.id},capture:'automatic'});
+    const payload=JSON.stringify({
+      amount:Math.round(appOrder.total*100),
+      currency:'INR',
+      accept_partial:false,
+      reference_id:appOrder.id,
+      description:'GAJAB RASODA Order '+appOrder.id,
+      customer:{name:appOrder.customerName||'Customer',contact:appOrder.customerPhone||''},
+      notify:{sms:false,email:false},
+      reminder_enable:false,
+      notes:{app_order_id:appOrder.id}
+    });
     const auth=Buffer.from(keyId+':'+secret).toString('base64');
-    const q=https.request({hostname:'api.razorpay.com',path:'/v1/orders',method:'POST',headers:{'Authorization':'Basic '+auth,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}},r=>{
-      let body='';r.on('data',d=>body+=d);r.on('end',()=>{try{const j=JSON.parse(body);if(r.statusCode>=200&&r.statusCode<300)return resolve(j);reject(new Error(j&&j.error&&j.error.description||'razorpay_order_failed'));}catch(e){reject(e);}});
+    const q=https.request({hostname:'api.razorpay.com',path:'/v1/payment_links',method:'POST',headers:{
+      'Authorization':'Basic '+auth,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)
+    }},r=>{
+      let body='';r.on('data',d=>body+=d);r.on('end',()=>{try{
+        const j=JSON.parse(body);
+        if(r.statusCode>=200&&r.statusCode<300)return resolve(j);
+        reject(new Error(j&&j.error&&j.error.description||'razorpay_payment_link_failed'));
+      }catch(e){reject(e);}});
     });
     q.on('error',reject);q.write(payload);q.end();
   });
 }
 app.get('/payments/start/:id',async(req,res)=>{
   const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).send('Order not found');
-  const keyId=process.env.RAZORPAY_KEY_ID||'';
-  if(!keyId||!process.env.RAZORPAY_KEY_SECRET)return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Online payment setup pending</h2><p>Razorpay Orders API keys are not configured on the backend yet.</p><p>Order '+o.id+' remains unpaid and will not be sent to the restaurant.</p></body></html>');
+  if(o.paymentStatus==='PAID')return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
+  if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET){
+    return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Razorpay approval pending</h2><p>Payment Links API cannot be created until Razorpay provides API keys for the approved website/app.</p><p>Order '+o.id+' is still unpaid. No false paid order has been created.</p></body></html>');
+  }
   try{
-    if(!o.razorpayOrderId){const rz=await createRazorpayOrder(o);o.razorpayOrderId=rz.id;o.updatedAt=now();}
-    const html=`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://checkout.razorpay.com/v1/checkout.js"></script></head><body style="font-family:Arial;background:#111;color:#fff;padding:24px"><h2 style="color:#e8ab2e">GAJAB RASODA</h2><p>Order ${o.id}</p><h3>Pay ₹${o.total}</h3><button id="pay" style="padding:14px 22px;border:0;border-radius:12px;background:#e51e24;color:white;font-weight:bold">Pay Online</button><div id="msg"></div><script>
-      const options={key:${JSON.stringify(keyId)},amount:${Math.round(o.total*100)},currency:"INR",name:"GAJAB RASODA",description:"Order ${o.id}",order_id:${JSON.stringify(o.razorpayOrderId)},handler:async function(r){
-        document.getElementById('msg').innerText='Verifying payment...';
-        const x=await fetch('/payments/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({appOrderId:${JSON.stringify(o.id)},razorpay_payment_id:r.razorpay_payment_id,razorpay_order_id:r.razorpay_order_id,razorpay_signature:r.razorpay_signature})});
-        const j=await x.json();document.getElementById('msg').innerText=j.ok?'Payment successful. Order sent to restaurant.':'Payment verification failed.';
-      },theme:{color:"#e51e24"}};
-      document.getElementById('pay').onclick=()=>new Razorpay(options).open();
-    </script></body></html>`;
-    res.type('html').send(html);
-  }catch(e){res.status(502).type('html').send('<html><body><h3>Payment could not start</h3><p>'+String(e.message||'')+'</p></body></html>');}
+    if(!o.razorpayPaymentLinkId||!o.razorpayPaymentLinkUrl){
+      const rz=await createRazorpayPaymentLink(o);
+      o.razorpayPaymentLinkId=rz.id||'';
+      o.razorpayPaymentLinkUrl=rz.short_url||'';
+      o.paymentReference=o.id;
+      o.paymentExpectedPaise=Math.round(o.total*100);
+      o.updatedAt=now();
+    }
+    if(!o.razorpayPaymentLinkUrl)throw new Error('payment_link_url_missing');
+    res.redirect(302,o.razorpayPaymentLinkUrl);
+  }catch(e){
+    res.status(502).type('html').send('<html><body style="font-family:Arial;padding:30px"><h3>Payment link could not start</h3><p>'+String(e.message||'')+'</p><p>Your order remains unpaid.</p></body></html>');
+  }
 });
-app.post('/payments/verify',(req,res)=>{
-  try{
-    const o=orders.find(x=>x.id===req.body.appOrderId);if(!o)return res.status(404).json({error:'order_not_found'});
-    if(!o.razorpayOrderId||o.razorpayOrderId!==req.body.razorpay_order_id)return res.status(400).json({error:'order_mismatch'});
-    const secret=process.env.RAZORPAY_KEY_SECRET||'';if(!secret)return res.status(503).json({error:'payment_not_configured'});
-    const expected=crypto.createHmac('sha256',secret).update(o.razorpayOrderId+'|'+String(req.body.razorpay_payment_id||'')).digest('hex');
-    const got=String(req.body.razorpay_signature||'');
-    if(expected.length!==got.length||!crypto.timingSafeEqual(Buffer.from(expected),Buffer.from(got)))return res.status(400).json({error:'invalid_signature'});
-    o.paymentStatus='PAID';o.paymentId=String(req.body.razorpay_payment_id);o.status='PLACED';o.updatedAt=now();
-    res.json({ok:true,orderId:o.id,status:o.status,paymentStatus:o.paymentStatus});
-  }catch(e){res.status(400).json({error:'verification_failed'});}
+
+app.get('/payments/status/:id',(req,res)=>{
+  const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});
+  res.json({orderId:o.id,paymentStatus:o.paymentStatus,status:o.status,expectedAmount:o.total,paymentId:o.paymentId||'',paymentLinkId:o.razorpayPaymentLinkId||''});
 });
 
 app.get('/partner/restaurant',(req,res)=>res.json(restaurant));
