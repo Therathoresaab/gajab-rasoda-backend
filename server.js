@@ -182,30 +182,42 @@ function createRazorpayPaymentLink(appOrder){
     q.on('error',reject);q.write(payload);q.end();
   });
 }
-app.get('/payments/start/:id',async(req,res)=>{
-  const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).send('Order not found');
-  if(o.paymentStatus==='PAID')return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
-  if(!process.env.RAZORPAY_KEY_ID||!process.env.RAZORPAY_KEY_SECRET){
-    return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Razorpay approval pending</h2><p>Payment Links API cannot be created until Razorpay provides API keys for the approved website/app.</p><p>Order '+o.id+' is still unpaid. No false paid order has been created.</p></body></html>');
+app.get('/payments/start/:id',(req,res)=>{
+  const o=orders.find(x=>x.id===req.params.id);
+  if(!o)return res.status(404).send('Order not found');
+  if(o.paymentStatus==='PAID'){
+    return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
   }
-  try{
-    if(!o.razorpayPaymentLinkId||!o.razorpayPaymentLinkUrl){
-      const rz=await createRazorpayPaymentLink(o);
-      o.razorpayPaymentLinkId=rz.id||'';
-      o.razorpayPaymentLinkUrl=rz.short_url||'';
-      o.paymentReference=o.id;
-      o.paymentExpectedPaise=Math.round(o.total*100);
-      o.updatedAt=now();
-    }
-    if(!o.razorpayPaymentLinkUrl)throw new Error('payment_link_url_missing');
-    res.redirect(302,o.razorpayPaymentLinkUrl);
-  }catch(e){
-    res.status(502).type('html').send('<html><body style="font-family:Arial;padding:30px"><h3>Payment link could not start</h3><p>'+String(e.message||'')+'</p><p>Your order remains unpaid.</p></body></html>');
-  }
+
+  // Temporary payment flow: redirect every checkout to the existing GAJAB RASODA Razorpay.me page.
+  // Order remains PAYMENT_PENDING until manually verified/approved from Company/Admin.
+  o.paymentReference=o.id;
+  o.paymentExpectedPaise=Math.round(o.total*100);
+  o.updatedAt=now();
+
+  const payUrl='https://razorpay.me/%40gajabrasoda';
+  res.redirect(302,payUrl);
 });
 
 app.get('/payments/status/:id',(req,res)=>{
   const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});
+
+app.post('/admin/orders/:id/approve-payment',(req,res)=>{
+  const o=orders.find(x=>x.id===req.params.id);
+  if(!o)return res.status(404).json({error:'order_not_found'});
+  const paidAmount=Number(req.body.amount||0);
+  if(paidAmount!==Number(o.total)){
+    o.paymentStatus='PAYMENT_REVIEW';
+    o.paymentReviewReason='manual_amount_mismatch';
+    o.updatedAt=now();
+    return res.status(409).json({error:'amount_mismatch',expected:o.total,received:paidAmount,order:o});
+  }
+  o.paymentStatus='PAID';
+  o.paymentId=String(req.body.paymentId||req.body.reference||'MANUAL');
+  o.status='PLACED';
+  o.updatedAt=now();
+  res.json({ok:true,order:o});
+});
   res.json({orderId:o.id,paymentStatus:o.paymentStatus,status:o.status,expectedAmount:o.total,paymentId:o.paymentId||'',paymentLinkId:o.razorpayPaymentLinkId||''});
 });
 
