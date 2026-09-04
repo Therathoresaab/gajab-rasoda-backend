@@ -6,10 +6,10 @@ let Pool=null;try{Pool=require('pg').Pool;}catch(e){}
 const dbPool=(Pool&&process.env.DATABASE_URL)?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='false'?false:{rejectUnauthorized:false}}):null;
 const app=express();
 const appVersions={
-  customer:{app:'customer',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
-  partner:{app:'partner',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
-  delivery:{app:'delivery',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
-  company:{app:'company',latestVersionCode:10,minSupportedVersionCode:10,latestVersionName:'1.0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
+  customer:{app:'customer',latestVersionCode:15,minSupportedVersionCode:10,latestVersionName:'1.3.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
+  partner:{app:'partner',latestVersionCode:15,minSupportedVersionCode:10,latestVersionName:'1.3.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
+  delivery:{app:'delivery',latestVersionCode:15,minSupportedVersionCode:10,latestVersionName:'1.3.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
+  company:{app:'company',latestVersionCode:15,minSupportedVersionCode:10,latestVersionName:'1.3.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
 };
 
 app.use(cors());
@@ -53,6 +53,13 @@ app.post('/webhooks/razorpay',express.raw({type:'application/json'}),(req,res)=>
 });
 app.use(express.json({limit:'4mb'}));
 app.use(express.urlencoded({extended:true}));
+app.use((req,res,next)=>{
+  if(req.method!=='GET'&&req.method!=='HEAD'&&req.method!=='OPTIONS'){
+    res.on('finish',()=>{if(res.statusCode<500)schedulePersist();});
+  }
+  next();
+});
+
 const PORT=process.env.PORT||3000;
 const now=()=>new Date().toISOString();
 function stampOrder(o,event){
@@ -84,24 +91,362 @@ const customers={}, riders={'GRD01':{id:'GRD01',name:'Delivery Partner 01',mobil
 const orders=[], onboarding=[], grievances=[], partnerPayouts=[], riderPayouts=[];
 const locations={}, riderAccounts={}, partnerAccounts={'GRR01':{restaurantId:'GRR01',payoutMethod:'',upiId:'',bankLast4:'',payoutEnabled:false}};
 
+
 function snapshotState(){return {seq,menu,restaurantMeta:{status:restaurant.status,activationDate:restaurant.activationDate},customers,riders,orders,onboarding,grievances,partnerPayouts,riderPayouts,locations,riderAccounts,partnerAccounts,appVersions};}
+
+async function ensureDbSchema(){
+  if(!dbPool)return;
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS app_state_meta(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      seq JSONB NOT NULL DEFAULT '{}'::jsonb,
+      restaurant_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      locations JSONB NOT NULL DEFAULT '{}'::jsonb,
+      rider_accounts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      partner_accounts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS customers(
+      customer_id TEXT PRIMARY KEY,
+      phone TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ,
+      raw JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS riders(
+      rider_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      mobile TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ACTIVE',
+      online BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ,
+      raw JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS menu_items(
+      item_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      price NUMERIC(12,2) NOT NULL,
+      available BOOLEAN NOT NULL DEFAULT TRUE,
+      image TEXT NOT NULL DEFAULT '',
+      raw JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS orders(
+      order_id TEXT PRIMARY KEY,
+      customer_id TEXT,
+      customer_phone TEXT,
+      restaurant_id TEXT,
+      status TEXT NOT NULL,
+      payment_status TEXT NOT NULL,
+      total NUMERIC(12,2) NOT NULL,
+      delivery_partner_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      raw JSONB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_orders_customer_phone_created ON orders(customer_phone,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_payment_status_created ON orders(payment_status,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_orders_rider_created ON orders(delivery_partner_id,created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS order_events(
+      id BIGSERIAL PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      event_time TIMESTAMPTZ NOT NULL,
+      source TEXT NOT NULL DEFAULT 'APP',
+      UNIQUE(order_id,event_type,event_time)
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_events_order_time ON order_events(order_id,event_time);
+
+    CREATE TABLE IF NOT EXISTS reviews(
+      review_id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      customer_id TEXT,
+      restaurant_id TEXT,
+      rider_id TEXT,
+      food_rating INTEGER,
+      rider_rating INTEGER,
+      comment TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      raw JSONB NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_one_per_order ON reviews(order_id);
+
+    CREATE TABLE IF NOT EXISTS grievances(
+      grievance_id TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ,
+      status TEXT,
+      raw JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS partner_payouts(
+      payout_id TEXT PRIMARY KEY,
+      order_id TEXT,
+      due_date DATE,
+      status TEXT,
+      raw JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS rider_payouts(
+      payout_id TEXT PRIMARY KEY,
+      order_id TEXT,
+      due_date DATE,
+      status TEXT,
+      raw JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS app_versions(
+      app TEXT PRIMARY KEY,
+      raw JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS app_audit_log(
+      id BIGSERIAL PRIMARY KEY,
+      action TEXT NOT NULL,
+      entity_type TEXT,
+      entity_id TEXT,
+      at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      detail JSONB NOT NULL DEFAULT '{}'::jsonb
+    
+    );
+    CREATE TABLE IF NOT EXISTS idempotency_keys(
+      idem_key TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      response_code INTEGER NOT NULL,
+      response_body JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys(expires_at);
+
+    CREATE TABLE IF NOT EXISTS auth_sessions(
+      session_id TEXT PRIMARY KEY,
+      actor_type TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_actor ON auth_sessions(actor_type,actor_id);
+
+    CREATE TABLE IF NOT EXISTS otp_attempts(
+      phone TEXT PRIMARY KEY,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      window_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      blocked_until TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications(
+      notification_id BIGSERIAL PRIMARY KEY,
+      actor_type TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      entity_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_actor_created ON notifications(actor_type,actor_id,created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS serviceability_rules(
+      rule_id BIGSERIAL PRIMARY KEY,
+      state TEXT NOT NULL,
+      city TEXT NOT NULL,
+      zone TEXT,
+      pincode TEXT,
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      delivery_fee NUMERIC(12,2) NOT NULL DEFAULT 0,
+      min_order NUMERIC(12,2) NOT NULL DEFAULT 0,
+      max_distance_km NUMERIC(8,2),
+      raw JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_serviceability_city_pin ON serviceability_rules(city,pincode,enabled);
+
+    CREATE TABLE IF NOT EXISTS refunds(
+      refund_id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      payment_reference TEXT,
+      amount NUMERIC(12,2) NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      raw JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS idx_refunds_order ON refunds(order_id,created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS support_tickets(
+      ticket_id TEXT PRIMARY KEY,
+      order_id TEXT,
+      actor_type TEXT NOT NULL,
+      actor_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      message TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'OPEN',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      raw JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_order ON support_tickets(order_id,created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS review_moderation(
+      review_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'VISIBLE',
+      reason TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS system_config(
+      config_key TEXT PRIMARY KEY,
+      config_value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+}
+
+function safeDate(v){return v||now();}
+async function persistNormalizedState(){
+  if(!dbPool||persistBusy)return;
+  persistBusy=true;
+  const client=await dbPool.connect();
+  try{
+    await client.query('BEGIN');
+    await client.query(`INSERT INTO app_state_meta(id,seq,restaurant_meta,locations,rider_accounts,partner_accounts,updated_at)
+      VALUES(1,$1::jsonb,$2::jsonb,$3::jsonb,$4::jsonb,$5::jsonb,NOW())
+      ON CONFLICT(id) DO UPDATE SET seq=EXCLUDED.seq,restaurant_meta=EXCLUDED.restaurant_meta,locations=EXCLUDED.locations,
+      rider_accounts=EXCLUDED.rider_accounts,partner_accounts=EXCLUDED.partner_accounts,updated_at=NOW()`,
+      [JSON.stringify(seq),JSON.stringify({status:restaurant.status,activationDate:restaurant.activationDate}),JSON.stringify(locations),JSON.stringify(riderAccounts),JSON.stringify(partnerAccounts)]);
+
+    for(const c of Object.values(customers)){
+      await client.query(`INSERT INTO customers(customer_id,phone,name,status,created_at,updated_at,raw)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)
+        ON CONFLICT(customer_id) DO UPDATE SET phone=EXCLUDED.phone,name=EXCLUDED.name,status=EXCLUDED.status,updated_at=EXCLUDED.updated_at,raw=EXCLUDED.raw`,
+        [c.customerId,c.phone,c.name||'',c.status||'ACTIVE',safeDate(c.createdAt),safeDate(c.updatedAt||c.createdAt),JSON.stringify(c)]);
+    }
+    for(const r of Object.values(riders)){
+      await client.query(`INSERT INTO riders(rider_id,name,mobile,status,online,created_at,updated_at,raw)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+        ON CONFLICT(rider_id) DO UPDATE SET name=EXCLUDED.name,mobile=EXCLUDED.mobile,status=EXCLUDED.status,online=EXCLUDED.online,updated_at=EXCLUDED.updated_at,raw=EXCLUDED.raw`,
+        [r.id,r.name||'',r.mobile||'',r.status||'ACTIVE',!!r.online,safeDate(r.createdAt),safeDate(r.updatedAt||r.createdAt),JSON.stringify(r)]);
+    }
+    for(const m of menu){
+      await client.query(`INSERT INTO menu_items(item_id,name,category,price,available,image,raw,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,NOW())
+        ON CONFLICT(item_id) DO UPDATE SET name=EXCLUDED.name,category=EXCLUDED.category,price=EXCLUDED.price,available=EXCLUDED.available,image=EXCLUDED.image,raw=EXCLUDED.raw,updated_at=NOW()`,
+        [m.id,m.name,m.category||'VEG',Number(m.price||0),!!m.available,m.image||'',JSON.stringify(m)]);
+    }
+    for(const o of orders){
+      await client.query(`INSERT INTO orders(order_id,customer_id,customer_phone,restaurant_id,status,payment_status,total,delivery_partner_id,created_at,updated_at,raw)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
+        ON CONFLICT(order_id) DO UPDATE SET customer_id=EXCLUDED.customer_id,customer_phone=EXCLUDED.customer_phone,restaurant_id=EXCLUDED.restaurant_id,
+        status=EXCLUDED.status,payment_status=EXCLUDED.payment_status,total=EXCLUDED.total,delivery_partner_id=EXCLUDED.delivery_partner_id,updated_at=EXCLUDED.updated_at,raw=EXCLUDED.raw`,
+        [o.id,o.customerId||'',o.customerPhone||'',o.restaurantId||restaurant.id,o.status||'',o.paymentStatus||'',Number(o.total||0),o.deliveryPartnerId||'',safeDate(o.createdAt),safeDate(o.updatedAt||o.createdAt),JSON.stringify(o)]);
+      if(o.timeline){
+        const map={paymentPendingAt:'PAYMENT_PENDING',paymentConfirmedAt:'PAID',placedAt:'PLACED',acceptedAt:'ACCEPTED',preparingAt:'PREPARING',readyAt:'READY',deliveryAcceptedAt:'DELIVERY_ACCEPTED',pickedUpAt:'PICKED_UP',outForDeliveryAt:'OUT_FOR_DELIVERY',deliveredAt:'DELIVERED',rejectedAt:'REJECTED'};
+        for(const [k,eventType] of Object.entries(map)){
+          if(o.timeline[k]){
+            await client.query(`INSERT INTO order_events(order_id,event_type,event_time,source)
+              VALUES($1,$2,$3,'APP') ON CONFLICT(order_id,event_type,event_time) DO NOTHING`,[o.id,eventType,o.timeline[k]]);
+          }
+        }
+      }
+    }
+    for(const g of grievances){
+      await client.query(`INSERT INTO grievances(grievance_id,created_at,status,raw) VALUES($1,$2,$3,$4::jsonb)
+        ON CONFLICT(grievance_id) DO UPDATE SET status=EXCLUDED.status,raw=EXCLUDED.raw`,
+        [g.id||g.grievanceId,safeDate(g.createdAt),g.status||'OPEN',JSON.stringify(g)]);
+    }
+    for(const x of partnerPayouts){
+      await client.query(`INSERT INTO partner_payouts(payout_id,order_id,due_date,status,raw) VALUES($1,$2,$3,$4,$5::jsonb)
+        ON CONFLICT(payout_id) DO UPDATE SET status=EXCLUDED.status,raw=EXCLUDED.raw`,
+        [x.id,x.orderId||'',x.dueDate||null,x.status||'',JSON.stringify(x)]);
+    }
+    for(const x of riderPayouts){
+      await client.query(`INSERT INTO rider_payouts(payout_id,order_id,due_date,status,raw) VALUES($1,$2,$3,$4,$5::jsonb)
+        ON CONFLICT(payout_id) DO UPDATE SET status=EXCLUDED.status,raw=EXCLUDED.raw`,
+        [x.id,x.orderId||'',x.dueDate||null,x.status||'',JSON.stringify(x)]);
+    }
+    for(const [appName,v] of Object.entries(appVersions)){
+      await client.query(`INSERT INTO app_versions(app,raw,updated_at) VALUES($1,$2::jsonb,NOW())
+        ON CONFLICT(app) DO UPDATE SET raw=EXCLUDED.raw,updated_at=NOW()`,[appName,JSON.stringify(v)]);
+    }
+    await client.query('COMMIT');
+  }catch(e){
+    await client.query('ROLLBACK');
+    console.error('normalized persist failed',e.message);
+  }finally{
+    client.release();persistBusy=false;
+  }
+}
+async function persistState(){return persistNormalizedState();}
+
 async function initPersistentState(){
   if(!dbPool){console.log('DATABASE_URL not set: running memory-only');return;}
-  await dbPool.query('CREATE TABLE IF NOT EXISTS gajab_state (id INTEGER PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
-  const r=await dbPool.query('SELECT data FROM gajab_state WHERE id=1');
-  if(!r.rows.length)return;
-  const d=r.rows[0].data||{};
-  if(d.seq)seq=Object.assign(seq,d.seq);
-  if(Array.isArray(d.menu)){menu.splice(0,menu.length,...d.menu);restaurant.menu=menu;}
-  if(d.restaurantMeta){restaurant.status=d.restaurantMeta.status||restaurant.status;restaurant.activationDate=d.restaurantMeta.activationDate||restaurant.activationDate;}
-  if(d.customers)Object.assign(customers,d.customers);if(d.riders)Object.assign(riders,d.riders);
-  if(Array.isArray(d.orders))orders.splice(0,orders.length,...d.orders);if(Array.isArray(d.onboarding))onboarding.splice(0,onboarding.length,...d.onboarding);if(Array.isArray(d.grievances))grievances.splice(0,grievances.length,...d.grievances);
-  if(Array.isArray(d.partnerPayouts))partnerPayouts.splice(0,partnerPayouts.length,...d.partnerPayouts);if(Array.isArray(d.riderPayouts))riderPayouts.splice(0,riderPayouts.length,...d.riderPayouts);
-  if(d.locations)Object.assign(locations,d.locations);if(d.riderAccounts)Object.assign(riderAccounts,d.riderAccounts);if(d.partnerAccounts)Object.assign(partnerAccounts,d.partnerAccounts);if(d.appVersions)Object.assign(appVersions,d.appVersions);
-  console.log('Persistent state loaded from PostgreSQL');
+  await ensureDbSchema();
+  const meta=await dbPool.query('SELECT * FROM app_state_meta WHERE id=1');
+  if(meta.rows.length){
+    const r=meta.rows[0];
+    if(r.seq)seq=Object.assign(seq,r.seq);
+    if(r.restaurant_meta){restaurant.status=r.restaurant_meta.status||restaurant.status;restaurant.activationDate=r.restaurant_meta.activationDate||restaurant.activationDate;}
+    if(r.locations)Object.assign(locations,r.locations);
+    if(r.rider_accounts)Object.assign(riderAccounts,r.rider_accounts);
+    if(r.partner_accounts)Object.assign(partnerAccounts,r.partner_accounts);
+  }
+
+  const m=await dbPool.query('SELECT raw FROM menu_items ORDER BY item_id');
+  if(m.rows.length){menu.splice(0,menu.length,...m.rows.map(x=>x.raw));restaurant.menu=menu;}
+
+  const c=await dbPool.query('SELECT raw FROM customers');
+  for(const row of c.rows){const x=row.raw;if(x&&x.phone)customers[x.phone]=x;}
+
+  const rr=await dbPool.query('SELECT raw FROM riders');
+  for(const row of rr.rows){const x=row.raw;if(x&&x.id)riders[x.id]=x;}
+
+  const oo=await dbPool.query('SELECT raw FROM orders ORDER BY created_at DESC');
+  if(oo.rows.length)orders.splice(0,orders.length,...oo.rows.map(x=>x.raw));
+
+  const gg=await dbPool.query('SELECT raw FROM grievances ORDER BY created_at DESC');
+  if(gg.rows.length)grievances.splice(0,grievances.length,...gg.rows.map(x=>x.raw));
+
+  const pp=await dbPool.query('SELECT raw FROM partner_payouts ORDER BY payout_id DESC');
+  if(pp.rows.length)partnerPayouts.splice(0,partnerPayouts.length,...pp.rows.map(x=>x.raw));
+
+  const rp=await dbPool.query('SELECT raw FROM rider_payouts ORDER BY payout_id DESC');
+  if(rp.rows.length)riderPayouts.splice(0,riderPayouts.length,...rp.rows.map(x=>x.raw));
+
+  const av=await dbPool.query('SELECT app,raw FROM app_versions');
+  for(const row of av.rows)if(appVersions[row.app])Object.assign(appVersions[row.app],row.raw);
+
+  console.log('Normalized PostgreSQL state loaded');
 }
-let persistBusy=false;async function persistState(){if(!dbPool||persistBusy)return;persistBusy=true;try{await dbPool.query('INSERT INTO gajab_state(id,data,updated_at) VALUES(1,$1::jsonb,NOW()) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated_at=NOW()',[JSON.stringify(snapshotState())]);}catch(e){console.error('persist failed',e.message);}finally{persistBusy=false;}}
-setInterval(()=>persistState(),2000);
+let persistBusy=false;
+let persistTimer=null;
+function schedulePersist(){
+  if(!dbPool)return;
+  clearTimeout(persistTimer);
+  persistTimer=setTimeout(()=>persistState(),100);
+}
+
+
+async function audit(action,entityType,entityId,detail){
+  if(!dbPool)return;
+  try{await dbPool.query('INSERT INTO app_audit_log(action,entity_type,entity_id,detail) VALUES($1,$2,$3,$4::jsonb)',
+    [action||'UNKNOWN',entityType||'',entityId||'',JSON.stringify(detail||{})]);}catch(e){}
+}
+async function cleanupExpiredSecurityRows(){
+  if(!dbPool)return;
+  try{
+    await dbPool.query("DELETE FROM idempotency_keys WHERE expires_at<NOW()");
+    await dbPool.query("DELETE FROM auth_sessions WHERE expires_at<NOW() OR revoked_at IS NOT NULL AND revoked_at<NOW()-INTERVAL '30 days'");
+  }catch(e){}
+}
+setInterval(cleanupExpiredSecurityRows,60*60*1000).unref();
+
 
 
 function nextId(k,p){seq[k]++;return id2(p,seq[k]);}
@@ -133,7 +478,38 @@ function ensurePayoutLedgers(order){
   }
 }
 
-app.get('/health',(req,res)=>res.json({ok:true,service:'Gajab Rasoda Backend',version:'1.0'}));
+app.get('/health',(req,res)=>res.json({ok:true,service:'Gajab Rasoda Backend',version:'1.5',database:dbPool?'configured':'memory-only'}));
+app.get('/health/db',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({ok:false,database:'not_configured'});
+  try{
+    const r=await dbPool.query('SELECT NOW() AS server_time');
+    const counts=await dbPool.query(`SELECT
+      (SELECT COUNT(*) FROM customers) customers,
+      (SELECT COUNT(*) FROM orders) orders,
+      (SELECT COUNT(*) FROM menu_items) menu_items,
+      (SELECT COUNT(*) FROM riders) riders`);
+    res.json({ok:true,database:'postgresql',serverTime:r.rows[0].server_time,counts:counts.rows[0]});
+  }catch(e){res.status(500).json({ok:false,error:'database_unavailable'});}
+});
+
+app.get('/ops/readiness',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({ok:false,reason:'database_not_configured'});
+  try{await dbPool.query('SELECT 1');res.json({ok:true,service:'ready',database:'ready'});}
+  catch(e){res.status(503).json({ok:false,reason:'database_unavailable'});}
+});
+app.get('/ops/summary',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({ok:false,reason:'database_not_configured'});
+  try{
+    const q=await dbPool.query(`SELECT
+      (SELECT COUNT(*) FROM orders) orders,
+      (SELECT COUNT(*) FROM orders WHERE status NOT IN ('DELIVERED','REJECTED','CANCELLED')) active_orders,
+      (SELECT COUNT(*) FROM customers) customers,
+      (SELECT COUNT(*) FROM riders) riders,
+      (SELECT COUNT(*) FROM support_tickets WHERE status='OPEN') open_tickets,
+      (SELECT COUNT(*) FROM refunds WHERE status NOT IN ('COMPLETED','FAILED')) pending_refunds`);
+    res.json({ok:true,counts:q.rows[0],at:now()});
+  }catch(e){res.status(500).json({ok:false,error:'summary_failed'});}
+});
 
 app.get('/app-config/:app',(req,res)=>{
   const x=appVersions[String(req.params.app||'').toLowerCase()];
@@ -246,10 +622,10 @@ app.post('/admin/orders/:id/approve-payment',(req,res)=>{
   const expectedAmount=Number(o.total);
   if(Math.abs(paidAmount-expectedAmount)>0.001){
     o.paymentStatus='PAYMENT_REVIEW';o.paymentReviewReason='manual_amount_mismatch';o.updatedAt=now();persistState();
-    return res.status(409).json({error:'amount_mismatch',expected:expectedAmount,received:paidAmount,orderId:o.id});
+    audit('PAYMENT_AMOUNT_MISMATCH','ORDER',o.id,{expected:expectedAmount,received:paidAmount,requestId:req.requestId});return res.status(409).json({error:'amount_mismatch',expected:expectedAmount,received:paidAmount,orderId:o.id,requestId:req.requestId});
   }
   o.paymentStatus='PAID';o.paymentId=paymentId;o.paymentReference=paymentId;o.status='PLACED';stampOrder(o,'PLACED');persistState();
-  res.json({ok:true,orderId:o.id,expectedAmount,receivedAmount:paidAmount,paymentStatus:o.paymentStatus,status:o.status});
+  audit('PAYMENT_APPROVED','ORDER',o.id,{amount:paidAmount,paymentReference:paymentId,requestId:req.requestId});res.json({ok:true,orderId:o.id,expectedAmount,receivedAmount:paidAmount,paymentStatus:o.paymentStatus,status:o.status,requestId:req.requestId});
 });
 
 app.get('/partner/restaurant',(req,res)=>res.json(restaurant));
@@ -338,4 +714,26 @@ app.get('/admin/grievances',(req,res)=>res.json({grievances}));
 app.get('/admin/payouts',(req,res)=>res.json({partnerPayouts,riderPayouts}));
 app.patch('/admin/payouts/:type/:id',(req,res)=>{const list=req.params.type==='partner'?partnerPayouts:riderPayouts;const p=list.find(x=>x.id===req.params.id);if(!p)return res.status(404).json({error:'not_found'});p.status=String(req.body.status||p.status);p.reference=String(req.body.reference||p.reference||'');p.updatedAt=now();res.json(p);});
 
-initPersistentState().then(()=>app.listen(PORT,()=>console.log('Gajab Rasoda backend persistent v1.1 running on :'+PORT))).catch(e=>{console.error('DB init failed',e);process.exit(1);});
+
+app.get('/admin/export/orders',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({error:'database_not_configured'});
+  try{
+    const q=await dbPool.query('SELECT order_id,status,payment_status,total,customer_id,customer_phone,delivery_partner_id,created_at,updated_at FROM orders ORDER BY created_at DESC LIMIT 5000');
+    res.json({ok:true,count:q.rows.length,orders:q.rows});
+  }catch(e){res.status(500).json({error:'export_failed'});}
+});
+app.get('/admin/config',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({error:'database_not_configured'});
+  const q=await dbPool.query('SELECT config_key,config_value,updated_at FROM system_config ORDER BY config_key');
+  res.json({ok:true,config:q.rows});
+});
+app.post('/admin/config/:key',async(req,res)=>{
+  if(!dbPool)return res.status(503).json({error:'database_not_configured'});
+  await dbPool.query(`INSERT INTO system_config(config_key,config_value,updated_at) VALUES($1,$2::jsonb,NOW())
+    ON CONFLICT(config_key) DO UPDATE SET config_value=EXCLUDED.config_value,updated_at=NOW()`,
+    [req.params.key,JSON.stringify(req.body||{})]);
+  await audit('CONFIG_UPDATED','CONFIG',req.params.key,{requestId:req.requestId});
+  res.json({ok:true,key:req.params.key});
+});
+
+initPersistentState().then(()=>persistState()).then(()=>app.listen(PORT,()=>console.log('Gajab Rasoda backend persistent v1.1 running on :'+PORT))).catch(e=>{console.error('DB init failed',e);process.exit(1);});
