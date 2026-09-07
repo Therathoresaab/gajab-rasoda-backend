@@ -86,16 +86,38 @@ const id2=(p,n)=>p+String(n).padStart(2,'0');
 let seq={customer:0,order:0,rider:1,restaurant:1,onboarding:0,grievance:0,partnerPayout:0,riderPayout:0};
 
 const menu=[
-{id:'chicken_thali',name:'Gajab Chicken Thali',price:169,available:true,category:'NON_VEG',image:''},
-{id:'egg_curry',name:'Gajab Egg Curry [2 Eggs]',price:139,available:true,category:'EGG',image:''},
-{id:'egg_bhurji',name:'Gajab Egg Bhurji [2 Eggs]',price:120,available:true,category:'EGG',image:''},
-{id:'omelette',name:'Gajab Omelette [2 Eggs]',price:99,available:true,category:'EGG',image:''},
-{id:'omelette_bread',name:'Gajab Omelette + Bread [2 Eggs]',price:129,available:true,category:'EGG',image:''},
-{id:'tawa_roti',name:'Tawa Roti',price:15,available:true,category:'VEG',image:''},
-{id:'butter_roti',name:'Tawa Roti with Butter',price:20,available:true,category:'VEG',image:''},
-{id:'paratha',name:'Paratha',price:25,available:true,category:'VEG',image:''},
-{id:'masala_chach',name:'Masala Chach',price:20,available:true,category:'VEG',image:''},
-{id:'chach',name:'Chach',price:15,available:true,category:'VEG',image:''}
+{id:"egg_curry",name:"Gajab Egg Curry [2 Eggs]",price:139,available:true,category:"EGG",image:''},
+{id:"egg_bhurji",name:"Gajab Egg Bhurji [2 Eggs]",price:120,available:true,category:"EGG",image:''},
+{id:"chicken_half",name:"Gajab Chicken Half [200 g]",price:299,available:true,category:"NON_VEG",image:''},
+{id:"chicken_full",name:"Gajab Chicken Full [400 g]",price:549,available:true,category:"NON_VEG",image:''},
+{id:"mutton_half",name:"Gajab Mutton Half [200 g]",price:399,available:true,category:"NON_VEG",image:''},
+{id:"mutton_full",name:"Gajab Mutton Full [400 g]",price:749,available:true,category:"NON_VEG",image:''},
+{id:"papad",name:"Gajab Papad [Serves 1]",price:10,available:true,category:"VEG",image:''},
+{id:"omelette",name:"Gajab Omelette [2 Eggs]",price:99,available:true,category:"EGG",image:''},
+{id:"omelette_bread",name:"Gajab Omelette [2 Eggs] with Bread",price:129,available:true,category:"EGG",image:''},
+{id:"tawa_roti",name:"Gajab Tawa Roti",price:15,available:true,category:"VEG",image:''},
+{id:"butter_roti",name:"Gajab Tawa Roti with Butter",price:20,available:true,category:"VEG",image:''},
+{id:"bati",name:"Gajab Bati [1 Piece]",price:20,available:true,category:"VEG",image:''},
+{id:"paratha",name:"Gajab Paratha",price:25,available:true,category:"VEG",image:''},
+{id:"papdi",name:"Gajab Papdi [Serves 1]",price:10,available:true,category:"VEG",image:''},
+{id:"chach",name:"Gajab Chaas [1 Glass]",price:15,available:true,category:"VEG",image:''},
+{id:"masala_chach",name:"Gajab Masala Chaas [1 Glass]",price:20,available:true,category:"VEG",image:''},
+{id:"sev_tamatar",name:"Gajab Sev Tamatar [Serves 1]",price:120,available:true,category:"VEG",image:''},
+{id:"mutton_thali",name:"Gajab Mutton Thali [100 g]",price:249,available:true,category:"NON_VEG",image:''},
+{id:"chicken_thali",name:"Gajab Chicken Thali [100 g]",price:189,available:true,category:"NON_VEG",image:''},
+{id:"egg_thali",name:"Gajab Egg Thali",price:169,available:true,category:"EGG",image:''},
+{id:"sev_thali",name:"Gajab Sev Tamatar Thali",price:139,available:true,category:"VEG",image:''},
+{id:"dal",name:"Gajab Dal",price:90,available:true,category:"VEG",image:''},
+{id:"egg_boil",name:"Gajab Egg Boil [2 Egg]",price:49,available:true,category:"EGG",image:''},
+{id:"egg_fried_boil",name:"Gajab Egg Fried Boiled [2 Egg]",price:79,available:true,category:"EGG",image:''},
+{id:"dal_thali",name:"Gajab Dal Thali",price:120,available:true,category:"VEG",image:''},
+{id:"sandwich",name:"Gajab Sendwich",price:49,available:true,category:"FAST_FOOD",image:''},
+{id:"grilled_sandwich",name:"Gajab Grilled Sandwich",price:79,available:true,category:"FAST_FOOD",image:''},
+{id:"maggie",name:"Gajab Meggie",price:49,available:true,category:"FAST_FOOD",image:''},
+{id:"masala_maggie",name:"Gajab Masala Meggie",price:69,available:true,category:"FAST_FOOD",image:''},
+{id:"cheese_maggie",name:"Gajab Cheese Maggie",price:99,available:true,category:"FAST_FOOD",image:''},
+{id:"egg_maggie",name:"Gajab Egg Meggie",price:89,available:true,category:"EGG",image:''},
+{id:"burger",name:"Gajab Burger",price:59,available:true,category:"FAST_FOOD",image:''}
 ];
 const restaurant={id:'GRR01',name:'Gajab Rasoda',status:'ONLINE',activationDate:now(),menu};
 const customers={}, riders={'GRD01':{id:'GRD01',name:'Delivery Partner 01',mobile:'',status:'ACTIVE',online:false,createdAt:now()}};
@@ -720,6 +742,17 @@ async function ensureRazorpayOrder(o){
   o.razorpayOrderId=String(r.id||'');o.paymentExpectedPaise=Math.round(o.total*100);o.paymentReference=o.id;o.updatedAt=now();schedulePersist();
   if(!o.razorpayOrderId)throw new Error('razorpay_order_missing');return o.razorpayOrderId;
 }
+app.get('/payments/checkout-config/:id',async(req,res)=>{
+  const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});
+  if(o.paymentStatus==='PAID')return res.status(409).json({error:'already_paid'});
+  try{
+    if(o.paymentStatus==='FAILED'){o.paymentStatus='PENDING';o.status='PAYMENT_PENDING';stampOrder(o,'PAYMENT_PENDING');}
+    const razorpayOrderId=await ensureRazorpayOrder(o),keyId=process.env.RAZORPAY_KEY_ID||'';
+    if(!keyId)return res.status(503).json({error:'payment_not_configured'});
+    res.json({orderId:o.id,keyId,razorpayOrderId,amount:Math.round(o.total*100),currency:'INR'});
+  }catch(e){res.status(503).json({error:'payment_temporarily_unavailable'});}
+});
+
 app.get('/payments/start/:id',async(req,res)=>{
   const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).send('Order not found');
   if(o.paymentStatus==='PAID')return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
