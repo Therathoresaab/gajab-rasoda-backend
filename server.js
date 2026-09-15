@@ -6,10 +6,10 @@ let Pool=null;try{Pool=require('pg').Pool;}catch(e){}
 const dbPool=(Pool&&process.env.DATABASE_URL)?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='false'?false:{rejectUnauthorized:false}}):null;
 const app=express();
 const appVersions={
-  customer:{app:'customer',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
-  partner:{app:'partner',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
-  delivery:{app:'delivery',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
-  company:{app:'company',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
+  customer:{app:'customer',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.1-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
+  partner:{app:'partner',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.1-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
+  delivery:{app:'delivery',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.1-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
+  company:{app:'company',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.1-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
 };
 
 app.use(cors());
@@ -711,7 +711,22 @@ app.post('/customer/orders',async(req,res)=>{
 });
 app.patch('/admin/orders/:id/cancel-test',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(o.status==='DELIVERED')return res.status(409).json({error:'delivered_order_cannot_be_cancelled'});o.status='CANCELLED';o.paymentStatus=o.paymentStatus==='PAID'?'PAID':'CANCELLED';o.updatedAt=now();audit('TEST_ORDER_CANCELLED','ORDER',o.id,{requestId:req.requestId});schedulePersist();res.json({ok:true,order:o});});
 app.get('/customer/orders',(req,res)=>{const cid=String(req.query.customerId||''),p=String(req.query.phone||'');res.json({orders:orders.filter(o=>(cid&&o.customerId===cid)||(p&&o.customerPhone===p))});});
-app.get('/customer/orders/:id',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});res.json({...o,tracking:locations[o.id]||null,restaurantStatus:restaurant.status});});
+async function reconcilePendingPaymentLink(o){
+  if(!o||o.paymentStatus!=='PENDING'||!o.razorpayPaymentLinkId)return o;
+  const t=Date.now();if(o.paymentLastReconcileAt&&t-Number(o.paymentLastReconcileAt)<4000)return o;
+  o.paymentLastReconcileAt=t;
+  try{
+    const pl=await razorpayRequest('/v1/payment_links/'+encodeURIComponent(o.razorpayPaymentLinkId),'GET');
+    const expectedPaise=Math.round(Number(o.total||0)*100),paidPaise=Number(pl.amount_paid||0),linkAmount=Number(pl.amount||0);
+    if(String(pl.status||'').toLowerCase()==='paid'&&paidPaise===expectedPaise&&linkAmount===expectedPaise){
+      o.paymentStatus='PAID';o.paymentReference=String(pl.reference_id||o.id);o.status='PLACED';o.paymentReviewReason='';stampOrder(o,'PAID');stampOrder(o,'PLACED');schedulePersist();
+    }else if(paidPaise>0&&(paidPaise!==expectedPaise||linkAmount!==expectedPaise)){
+      o.paymentStatus='PAYMENT_REVIEW';o.paymentReviewReason='payment_link_reconcile_amount_mismatch';o.updatedAt=now();schedulePersist();
+    }
+  }catch(e){o.paymentReconcileError=String(e&&e.message||'reconcile_failed');o.updatedAt=now();}
+  return o;
+}
+app.get('/customer/orders/:id',async(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});await reconcilePendingPaymentLink(o);res.json({...o,tracking:locations[o.id]||null,restaurantStatus:restaurant.status});});
 
 
 function razorpayRequest(path,method,data){
