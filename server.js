@@ -6,10 +6,10 @@ let Pool=null;try{Pool=require('pg').Pool;}catch(e){}
 const dbPool=(Pool&&process.env.DATABASE_URL)?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='false'?false:{rejectUnauthorized:false}}):null;
 const app=express();
 const appVersions={
-  customer:{app:'customer',latestVersionCode:1101,minSupportedVersionCode:10,latestVersionName:'1.10.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
-  partner:{app:'partner',latestVersionCode:1101,minSupportedVersionCode:10,latestVersionName:'1.10.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
-  delivery:{app:'delivery',latestVersionCode:1101,minSupportedVersionCode:10,latestVersionName:'1.10.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
-  company:{app:'company',latestVersionCode:1101,minSupportedVersionCode:10,latestVersionName:'1.10.1',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
+  customer:{app:'customer',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Version 1.0'},
+  partner:{app:'partner',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Partner Version 1.0'},
+  delivery:{app:'delivery',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Delivery Version 1.0'},
+  company:{app:'company',latestVersionCode:1150,minSupportedVersionCode:10,latestVersionName:'1.15.0-P0',forceUpdate:false,updateUrl:'',releaseNotes:'GAJAB RASODA Company Version 1.0'}
 };
 
 app.use(cors());
@@ -665,7 +665,7 @@ app.patch('/admin/app-versions/:app',(req,res)=>{
 app.get('/customer/restaurant',(req,res)=>res.json(restaurant));
 app.get('/customer/menu',(req,res)=>res.json({restaurantId:restaurant.id,status:restaurant.status,menu:restaurant.menu}));
 app.post('/customer/profile',(req,res)=>{
-  const phone=String(req.body.phone||'').trim();if(!phone)return res.status(400).json({error:'phone_required'});
+  const phone=String(req.body.phone||'').replace(/\D/g,'');if(!/^[6-9]\d{9}$/.test(phone))return res.status(400).json({error:'valid_indian_mobile_required'});
   let c=customers[phone];if(!c)c=customers[phone]={customerId:nextId('customer','GRC'),name:'',phone,addresses:[],status:'ACTIVE',createdAt:now()};
   if(req.body.name)c.name=String(req.body.name);if(req.body.address&&!c.addresses.includes(req.body.address))c.addresses.unshift(String(req.body.address));
   c.updatedAt=now();res.json(c);
@@ -673,9 +673,21 @@ app.post('/customer/profile',(req,res)=>{
 app.get('/customer/profile/:phone',(req,res)=>customers[req.params.phone]?res.json(customers[req.params.phone]):res.status(404).json({error:'customer_not_found'}));
 app.post('/customer/profile/:phone/addresses',(req,res)=>{
   const c=customers[req.params.phone];if(!c)return res.status(404).json({error:'customer_not_found'});
-  const a=String(req.body.address||'').trim();if(!a)return res.status(400).json({error:'address_required'});if(!c.addresses.includes(a))c.addresses.unshift(a);c.updatedAt=now();res.json(c);
+  const a=String(req.body.address||'').trim();if(!a)return res.status(400).json({error:'address_required'});
+  const label=['HOME','OFFICE','OTHER'].includes(String(req.body.label||'HOME').toUpperCase())?String(req.body.label||'HOME').toUpperCase():'OTHER';
+  c.savedAddresses=Array.isArray(c.savedAddresses)?c.savedAddresses:[];
+  const rec={id:'ADDR'+Date.now(),label,address:a,isDefault:req.body.isDefault===true,createdAt:now()};
+  if(rec.isDefault)c.savedAddresses.forEach(x=>x.isDefault=false);
+  c.savedAddresses.unshift(rec);if(!c.addresses.includes(a))c.addresses.unshift(a);c.updatedAt=now();res.json(c);
 });
-app.post('/customer/orders',(req,res)=>{
+async function ensureRazorpayPaymentLink(o){
+  if(o.razorpayPaymentLinkId&&o.paymentUrl)return o.paymentUrl;
+  const r=await razorpayRequest('/v1/payment_links','POST',{amount:Math.round(o.total*100),currency:'INR',accept_partial:false,reference_id:o.id,description:'GAJAB RASODA Order '+o.id,customer:{name:o.customerName||'Customer',contact:o.customerPhone||''},notify:{sms:false,email:false},reminder_enable:false,notes:{app_order_id:o.id}});
+  o.razorpayPaymentLinkId=String(r.id||'');o.paymentUrl=String(r.short_url||'');o.paymentExpectedPaise=Math.round(o.total*100);o.paymentReference=o.id;o.updatedAt=now();schedulePersist();
+  if(!o.paymentUrl)throw new Error('payment_link_missing');return o.paymentUrl;
+}
+
+app.post('/customer/orders',async(req,res)=>{
   if(restaurant.status!=='ONLINE')return res.status(409).json({error:'restaurant_offline'});
   const attempt=String(req.body.checkoutAttemptId||'').trim();
   if(attempt){
@@ -684,7 +696,7 @@ app.post('/customer/orders',(req,res)=>{
       const sameCart=JSON.stringify((existing.items||[]).map(i=>({id:i.id,qty:Number(i.qty||1)})))===JSON.stringify((req.body.items||[]).map(i=>({id:i.id,qty:Number(i.qty||1)})));
       const reusable=existing.paymentStatus==='PENDING' && existing.status==='PAYMENT_PENDING' && sameCart;
       if(reusable){
-        existing.paymentUrl=req.protocol+'://'+req.get('host')+'/payments/start/'+encodeURIComponent(existing.id);
+        try{await ensureRazorpayPaymentLink(existing);}catch(e){return res.status(503).json({error:'payment_temporarily_unavailable'});}
         return res.json(existing);
       }
     }
@@ -694,7 +706,7 @@ app.post('/customer/orders',(req,res)=>{
   for(const raw of items){const m=menu.find(x=>x.id===raw.id)||menu.find(x=>x.name===raw.name);if(!m)return res.status(400).json({error:'unknown_item'});if(!m.available)return res.status(409).json({error:'item_unavailable',item:m.id});const q=Math.max(1,Number(raw.qty||1));normalized.push({id:m.id,name:m.name,qty:q,price:m.price,category:m.category,image:m.image||''});total+=m.price*q;}
   const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),checkoutAttemptId:attempt,createdAt:now(),updatedAt:now(),history:[{status:'OPEN',at:now(),message:'Grievance submitted'}]};
   orders.unshift(o);
-  o.paymentUrl=req.protocol+'://'+req.get('host')+'/payments/start/'+encodeURIComponent(o.id);
+  try{await ensureRazorpayPaymentLink(o);}catch(e){return res.status(503).json({error:'payment_temporarily_unavailable'});}
   res.status(201).json(o);
 });
 app.patch('/admin/orders/:id/cancel-test',(req,res)=>{const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});if(o.status==='DELIVERED')return res.status(409).json({error:'delivered_order_cannot_be_cancelled'});o.status='CANCELLED';o.paymentStatus=o.paymentStatus==='PAID'?'PAID':'CANCELLED';o.updatedAt=now();audit('TEST_ORDER_CANCELLED','ORDER',o.id,{requestId:req.requestId});schedulePersist();res.json({ok:true,order:o});});
@@ -722,17 +734,9 @@ async function ensureRazorpayOrder(o){
 }
 app.get('/payments/start/:id',async(req,res)=>{
   const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).send('Order not found');
-  if(o.paymentStatus==='PAID')return res.type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
-  try{
-    if(o.paymentStatus==='FAILED'){o.paymentStatus='PENDING';o.status='PAYMENT_PENDING';stampOrder(o,'PAYMENT_PENDING');}
-    const razorOrderId=await ensureRazorpayOrder(o),keyId=process.env.RAZORPAY_KEY_ID||'';
-    const safe=x=>JSON.stringify(String(x||''));
-    res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay ${o.id}</title><script src="https://checkout.razorpay.com/v1/checkout.js"></script></head><body style="font-family:Arial;background:#0b0b0b;color:#fff;padding:28px"><h2>GAJAB RASODA</h2><p>Order <b>${o.id}</b> • ₹${Number(o.total).toFixed(2)}</p><p id="msg">Opening secure Razorpay checkout…</p><button id="retry" style="display:none;padding:14px 22px">Retry Payment</button><script>
-const opts={key:${safe(keyId)},amount:${Math.round(o.total*100)},currency:'INR',name:'GAJAB RASODA',description:'Order ${o.id}',order_id:${safe(razorOrderId)},prefill:{name:${safe(o.customerName)},contact:${safe(o.customerPhone)}},theme:{color:'#e52323'},handler:async function(r){document.getElementById('msg').textContent='Verifying payment…';const x=await fetch('/payments/verify/${encodeURIComponent(o.id)}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(r)});const j=await x.json();if(x.ok&&j.paymentStatus==='PAID'){document.body.innerHTML='<h2>Payment successful</h2><p>Order ${o.id} has been sent to the restaurant.</p>';}else{document.getElementById('msg').textContent='Payment verification needs review. Please do not pay again.';}}};
-const rz=new Razorpay(opts);rz.on('payment.failed',async function(r){await fetch('/payments/failed/${encodeURIComponent(o.id)}',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:(r.error&&r.error.description)||'Payment failed'})});document.getElementById('msg').textContent='Payment failed. You can retry safely.';document.getElementById('retry').style.display='inline-block';});
-function openPay(){rz.open()} document.getElementById('retry').onclick=openPay;openPay();
-</script></body></html>`);
-  }catch(e){res.status(503).type('html').send('<html><body style="font-family:Arial;padding:30px"><h2>Payment temporarily unavailable</h2><p>Please try again shortly.</p></body></html>');}
+  if(o.paymentStatus==='PAID')return res.type('html').send('<html><body><h2>Payment already received</h2><p>Order '+o.id+' has already been sent to the restaurant.</p></body></html>');
+  try{if(o.paymentStatus==='FAILED'){o.paymentStatus='PENDING';o.status='PAYMENT_PENDING';stampOrder(o,'PAYMENT_PENDING');}const url=await ensureRazorpayPaymentLink(o);return res.redirect(302,url);}
+  catch(e){return res.status(503).type('html').send('<html><body><h2>Payment temporarily unavailable</h2><p>Please try again shortly.</p></body></html>');}
 });
 app.post('/payments/verify/:id',(req,res)=>{
   const o=orders.find(x=>x.id===req.params.id);if(!o)return res.status(404).json({error:'order_not_found'});
