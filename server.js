@@ -662,8 +662,24 @@ app.patch('/admin/app-versions/:app',(req,res)=>{
   res.json(x);
 });
 
+// V1.16 multi-restaurant marketplace. GRR01 remains the original outlet; additional outlets are company-managed.
+async function readRestaurants(){
+  const saved=await readCfg('restaurants_v1',null);
+  const base={id:restaurant.id,name:restaurant.name,status:restaurant.status,activationDate:restaurant.activationDate,menu:restaurant.menu,address:'Bhilwara, Rajasthan',rating:0,ratingCount:0,rankScore:100,featured:false,sponsored:false,adPriority:0,approved:true};
+  if(!saved||!Array.isArray(saved)||!saved.length)return [base];
+  const out=saved.filter(Boolean);const i=out.findIndex(x=>x.id===restaurant.id);if(i<0)out.push(base);else out[i]={...base,...out[i],menu:Array.isArray(out[i].menu)&&out[i].menu.length?out[i].menu:restaurant.menu,status:out[i].status||restaurant.status};return out;
+}
+async function saveRestaurants(list){await writeCfg('restaurants_v1',list);return list;}
+function publicRestaurant(x){return {id:x.id,name:x.name,status:x.status||'OFFLINE',address:x.address||'',locality:x.locality||'',logo:x.logo||'',coverImage:x.coverImage||'',rating:Number(x.rating||0),ratingCount:Number(x.ratingCount||0),rankScore:Number(x.rankScore||0),featured:!!x.featured,sponsored:!!x.sponsored,adPriority:Number(x.adPriority||0),cuisine:x.cuisine||'',etaMin:Number(x.etaMin||0),serviceRadiusKm:Number(x.serviceRadiusKm||10)};}
+function marketplaceSort(a,b){if(!!a.sponsored!==!!b.sponsored)return a.sponsored?-1:1;if(Number(a.adPriority||0)!==Number(b.adPriority||0))return Number(b.adPriority||0)-Number(a.adPriority||0);if(!!a.featured!==!!b.featured)return a.featured?-1:1;return Number(b.rankScore||0)-Number(a.rankScore||0);}
+app.get('/customer/restaurants',async(req,res)=>{const list=(await readRestaurants()).filter(x=>x.approved!==false&&x.status!=='DEEMPANELLED').sort(marketplaceSort).map(publicRestaurant);res.json({restaurants:list});});
+app.get('/customer/restaurants/:id',async(req,res)=>{const x=(await readRestaurants()).find(r=>r.id===req.params.id);if(!x||x.approved===false)return res.status(404).json({error:'restaurant_not_found'});res.json({...publicRestaurant(x),menu:x.menu||[]});});
 app.get('/customer/restaurant',(req,res)=>res.json(restaurant));
 app.get('/customer/menu',(req,res)=>res.json({restaurantId:restaurant.id,status:restaurant.status,menu:restaurant.menu}));
+app.get('/admin/restaurants',async(req,res)=>{let list=await readRestaurants();const q=String(req.query.q||'').toLowerCase();if(q)list=list.filter(x=>String(x.id+' '+x.name+' '+(x.mobile||'')).toLowerCase().includes(q));res.json({restaurants:list});});
+app.post('/admin/restaurants',async(req,res)=>{const list=await readRestaurants();const id=nextId('restaurant','GRR');const x={id,name:String(req.body.name||'New Restaurant'),ownerName:String(req.body.ownerName||''),mobile:String(req.body.mobile||''),address:String(req.body.address||''),status:'OFFLINE',approved:true,featured:false,sponsored:false,adPriority:0,rankScore:0,serviceRadiusKm:Number(req.body.serviceRadiusKm||10),menu:Array.isArray(req.body.menu)?req.body.menu:[],createdAt:now(),updatedAt:now()};list.push(x);await saveRestaurants(list);res.status(201).json(x);});
+app.patch('/admin/restaurants/:id',async(req,res)=>{const list=await readRestaurants();const x=list.find(r=>r.id===req.params.id);if(!x)return res.status(404).json({error:'restaurant_not_found'});['name','ownerName','mobile','address','locality','status','cuisine','logo','coverImage'].forEach(k=>{if(req.body[k]!==undefined)x[k]=req.body[k];});['featured','sponsored','approved'].forEach(k=>{if(req.body[k]!==undefined)x[k]=!!req.body[k];});['adPriority','rankScore','serviceRadiusKm','etaMin'].forEach(k=>{if(req.body[k]!==undefined)x[k]=Number(req.body[k]||0);});if(Array.isArray(req.body.menu))x.menu=req.body.menu;x.updatedAt=now();await saveRestaurants(list);res.json(x);});
+app.post('/admin/restaurants/:id/deempanel',async(req,res)=>{const list=await readRestaurants();const x=list.find(r=>r.id===req.params.id);if(!x)return res.status(404).json({error:'restaurant_not_found'});x.status='DEEMPANELLED';x.approved=false;x.updatedAt=now();await saveRestaurants(list);res.json(x);});
 app.post('/customer/profile',(req,res)=>{
   const phone=String(req.body.phone||'').replace(/\D/g,'');if(!/^[6-9]\d{9}$/.test(phone))return res.status(400).json({error:'valid_indian_mobile_required'});
   let c=customers[phone];if(!c)c=customers[phone]={customerId:nextId('customer','GRC'),name:'',phone,addresses:[],status:'ACTIVE',createdAt:now()};
@@ -688,7 +704,8 @@ async function ensureRazorpayPaymentLink(o){
 }
 
 app.post('/customer/orders',async(req,res)=>{
-  if(restaurant.status!=='ONLINE')return res.status(409).json({error:'restaurant_offline'});
+  const requestedRid=String(req.body.restaurantId||restaurant.id);const rr=(await readRestaurants()).find(x=>x.id===requestedRid);if(!rr||rr.approved===false)return res.status(404).json({error:'restaurant_not_found'});
+  if(String(rr.status||'OFFLINE')!=='ONLINE')return res.status(409).json({error:'restaurant_offline'});
   const attempt=String(req.body.checkoutAttemptId||'').trim();
   if(attempt){
     const existing=orders.find(x=>x.checkoutAttemptId===attempt && x.customerPhone===String(req.body.customerPhone||''));
@@ -703,8 +720,9 @@ app.post('/customer/orders',async(req,res)=>{
   }
   const items=req.body.items;if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'items_required'});
   let total=0;const normalized=[];
-  for(const raw of items){const m=menu.find(x=>x.id===raw.id)||menu.find(x=>x.name===raw.name);if(!m)return res.status(400).json({error:'unknown_item'});if(!m.available)return res.status(409).json({error:'item_unavailable',item:m.id});const q=Math.max(1,Number(raw.qty||1));normalized.push({id:m.id,name:m.name,qty:q,price:m.price,category:m.category,image:m.image||''});total+=m.price*q;}
-  const o={id:nextId('order','GRO'),restaurantId:restaurant.id,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),checkoutAttemptId:attempt,createdAt:now(),updatedAt:now(),history:[{status:'OPEN',at:now(),message:'Grievance submitted'}]};
+  const orderMenu=Array.isArray(rr.menu)?rr.menu:[];
+  for(const raw of items){const m=orderMenu.find(x=>x.id===raw.id)||orderMenu.find(x=>x.name===raw.name);if(!m)return res.status(400).json({error:'unknown_item'});if(!m.available)return res.status(409).json({error:'item_unavailable',item:m.id});const q=Math.max(1,Number(raw.qty||1));normalized.push({id:m.id,name:m.name,qty:q,price:m.price,category:m.category,image:m.image||''});total+=m.price*q;}
+  const o={id:nextId('order','GRO'),restaurantId:rr.id,restaurantName:rr.name,customerId:String(req.body.customerId||''),customerName:String(req.body.customerName||'Customer'),customerPhone:String(req.body.customerPhone||''),address:String(req.body.address||''),items:normalized,total,status:'PAYMENT_PENDING',paymentStatus:'PENDING',deliveryPin:String(Math.floor(1000+Math.random()*9000)),deliveryPartnerId:'',deliveryDistanceKm:Number(req.body.deliveryDistanceKm||3),checkoutAttemptId:attempt,createdAt:now(),updatedAt:now(),history:[{status:'OPEN',at:now(),message:'Grievance submitted'}]};
   orders.unshift(o);
   try{await ensureRazorpayPaymentLink(o);}catch(e){return res.status(503).json({error:'payment_temporarily_unavailable'});}
   res.status(201).json(o);
@@ -869,7 +887,7 @@ app.get('/admin/customers',(req,res)=>res.json({customers:Object.values(customer
 app.get('/admin/riders',(req,res)=>res.json({riders:Object.values(riders).map(r=>({...r,payout:riderAccounts[r.id]||{}}))}));
 app.get('/admin/orders',(req,res)=>res.json({orders}));
 app.get('/admin/onboarding',(req,res)=>res.json({requests:onboarding}));
-app.patch('/admin/onboarding/:id',(req,res)=>{const x=onboarding.find(a=>a.id===req.params.id);if(!x)return res.status(404).json({error:'not_found'});x.status=String(req.body.status||x.status);x.updatedAt=now();if(x.type==='RESTAURANT'&&x.status==='APPROVED'&&!x.createdEntityId){x.createdEntityId=nextId('restaurant','GRR');}if(x.type==='RIDER'&&x.status==='APPROVED'&&!x.createdEntityId){const id=nextId('rider','GRD');riders[id]={id,name:x.name,mobile:x.mobile,status:'ACTIVE',online:false,createdAt:now()};x.createdEntityId=id;}res.json(x);});
+app.patch('/admin/onboarding/:id',async(req,res)=>{const x=onboarding.find(a=>a.id===req.params.id);if(!x)return res.status(404).json({error:'not_found'});x.status=String(req.body.status||x.status);x.updatedAt=now();if(x.type==='RESTAURANT'&&x.status==='APPROVED'&&!x.createdEntityId){const list=await readRestaurants();const id=nextId('restaurant','GRR');list.push({id,name:x.name||'New Restaurant',ownerName:x.ownerName||'',mobile:x.mobile||'',address:x.address||'',status:'OFFLINE',approved:true,featured:false,sponsored:false,adPriority:0,rankScore:0,serviceRadiusKm:10,menu:[],createdAt:now()});await saveRestaurants(list);x.createdEntityId=id;}if(x.type==='RIDER'&&x.status==='APPROVED'&&!x.createdEntityId){const id=nextId('rider','GRD');riders[id]={id,name:x.name,mobile:x.mobile,status:'ACTIVE',online:false,createdAt:now()};x.createdEntityId=id;}res.json(x);});
 app.get('/admin/grievances',(req,res)=>res.json({grievances}));
 app.get('/admin/payouts',(req,res)=>{const partner=partnerPayouts.map(p=>safePayoutView('partner',p)),rider=riderPayouts.map(p=>safePayoutView('rider',p));const all=[...partner.map(x=>({...x,type:'partner'})),...rider.map(x=>({...x,type:'rider'}))];res.json({razorpayXConfigured:payoutConfigReady(),summary:{due:all.filter(isPayoutDue).length,processing:all.filter(x=>['PROCESSING','INITIATED','QUEUED','PENDING'].includes(String(x.status))).length,paid:all.filter(x=>['PAID','PROCESSED'].includes(String(x.status))).length,failed:all.filter(x=>String(x.status).startsWith('FAILED')).length,dueAmount:Math.round(all.filter(isPayoutDue).reduce((a,x)=>a+payoutAmount(x),0)*100)/100},partnerPayouts:partner,riderPayouts:rider});});
 app.post('/admin/payouts/run-due',async(req,res)=>{const results=await runDuePayouts('COMPANY_ONE_CLICK_ALL');res.json({ok:true,results,processed:results.filter(x=>x.ok&&!x.skipped).length,failed:results.filter(x=>!x.ok).length});});
